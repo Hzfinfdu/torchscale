@@ -19,7 +19,21 @@ try:
     from apex.normalization import FusedLayerNorm as LayerNorm
 except ModuleNotFoundError:
     from torch.nn import LayerNorm
-    
+
+from transformers.modeling_outputs import CausalLMOutput
+from dataclasses import dataclass
+from typing import Optional, Tuple, Any
+
+
+@dataclass
+class RetNetOutput(CausalLMOutput):
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    l_aux: Optional[Tuple[Any]] = None
+
+
     
 class RetNetRelPos(nn.Module):
     def __init__(self, args):
@@ -213,7 +227,10 @@ class RetNetDecoder(nn.Module):
         self.embed_dim = embed_dim
         self.embed_scale = 1.0 if args.no_scale_embedding else math.sqrt(embed_dim)
 
-        self.embed_tokens = embed_tokens
+        if embed_tokens is not None:
+            self.embed_tokens = embed_tokens
+        else:
+            self.embed_tokens = torch.nn.Embedding(args.vocab_size, embed_dim, padding_idx=args.pad_token_id)
 
         if (
             output_projection is None
@@ -275,6 +292,8 @@ class RetNetDecoder(nn.Module):
                     or "v_proj" in name
                 ):
                     p.data.mul_(init_scale)
+
+        self.loss_fcn = nn.CrossEntropyLoss(ignore_index=args.pad_token_id, reduction="mean")
 
     def build_output_projection(
         self,
@@ -338,13 +357,14 @@ class RetNetDecoder(nn.Module):
 
     def forward(
         self,
-        prev_output_tokens,
+        input_ids,
         incremental_state=None,
         features_only=False,
         return_all_hiddens=False,
         token_embeddings=None,
         **kwargs
     ):
+        prev_output_tokens = input_ids
         # embed tokens
         x, _ = self.forward_embedding(
             prev_output_tokens, token_embeddings, incremental_state
@@ -362,9 +382,9 @@ class RetNetDecoder(nn.Module):
         retention_rel_pos = self.retnet_rel_pos(slen, incremental_state is not None and not is_first_step, chunkwise_recurrent=self.chunkwise_recurrent)
 
         # decoder layers
-        inner_states = [x]
+        inner_states = (x,)
 
-        l_aux = []
+        l_aux = ()
 
         for idx, layer in enumerate(self.layers):
             if incremental_state is None or is_first_step:
@@ -381,8 +401,8 @@ class RetNetDecoder(nn.Module):
                 retention_rel_pos=retention_rel_pos,
                 chunkwise_recurrent=self.chunkwise_recurrent,
             )
-            l_aux.append(l_aux_i)
-            inner_states.append(x)
+            l_aux += (l_aux_i,)
+            inner_states += (x,)
             
         if self.chunkwise_recurrent and prev_output_tokens.size(1) % self.recurrent_chunk_size != 0:
             x = x[:, :prev_output_tokens.size(1), :]
@@ -393,11 +413,15 @@ class RetNetDecoder(nn.Module):
         if not features_only:
             x = self.output_layer(x)
 
-        return x, {
-            "inner_states": inner_states,
-            "l_aux": l_aux,
-            "attn": None,
-        }
+        loss = self.loss_fcn(x[:, :-1, :].reshape(-1, x.size(-1)), input_ids[:, 1:].reshape(-1))
+
+        return RetNetOutput(
+            loss=loss,
+            logits=x,
+            hidden_states=inner_states,
+            l_aux=l_aux,
+            attentions=None
+        )
 
     def output_layer(self, features):
         return self.output_projection(features)
